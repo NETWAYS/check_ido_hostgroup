@@ -1,0 +1,390 @@
+#!/usr/bin/env python
+# check_ido_hostgroup
+#
+# Based on: check_ido_bp
+#
+# Copyright (c) 2015-2018 NETWAYS GmbH <info@netways.de>
+#
+# This program is free software: you can redistribute it and/or modify
+# it under the terms of the GNU General Public License as published by
+# the Free Software Foundation, either version 3 of the License, or
+# (at your option) any later version.
+#
+# This program is distributed in the hope that it will be useful,
+# but WITHOUT ANY WARRANTY; without even the implied warranty of
+# MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+# GNU General Public License for more details.
+#
+# You should have received a copy of the GNU General Public License
+# along with this program.  If not, see <http://www.gnu.org/licenses/>.
+
+import sys, os, getopt
+import MySQLdb
+import urllib2
+import re
+
+STATE_MAP = {
+    0: 'OK',
+    1: 'WARNING',
+    2: 'CRITICAL',
+    3: 'UNKNOWN'
+}
+
+def get_state_text(state):
+    if type(state) is str:
+        state = int(state)
+
+    if state in STATE_MAP:
+        return STATE_MAP[state]
+    else:
+        return STATE_MAP[3]
+
+def get_threshold(threshold, value, total):
+    if threshold == None:
+        return None
+
+    match = re.match('^(?P<threshold>-?\d+)%$', threshold)
+
+    if match:
+        return float(match.group('threshold')) / 100 * total
+    else:
+        return float(threshold)
+
+def check_threshold(threshold, value, total):
+    if threshold == None:
+        return True
+
+    threshold_val = get_threshold(threshold, value, total)
+
+    if threshold_val == None:
+        return True
+
+    return value < threshold_val
+
+def get_service_sql_filter(service_list):
+    parts = []
+
+    for service in service_list:
+        service = service.replace('*', '%')
+        parts.append("name2 LIKE '%s'" % MySQLdb.escape_string(service))
+
+    if len(parts) > 0:
+        return '(%s)' % ' OR '.join(parts)
+    else:
+        return ''
+
+def main():
+    try:
+        opts, args = getopt.getopt(
+            sys.argv[1:],
+            'C:c:w:g:S:WvH',
+            [
+                'config=',
+                'critical=',
+                'warning=',
+                'hostgroup=',
+                'warning-is-non-ok',
+                'service=',
+                'show-all',
+                'icingaweb2=',
+                'honor-state',
+                'only-warnings'
+            ]
+        )
+    except getopt.GetoptError:
+        t, e = sys.exc_info()[:2]
+        print str(e)
+        usage()
+        sys.exit(3)
+
+    config = None
+    critical_threshold = None
+    warning_threshold = None
+    hostgroup = None
+    warning_is_non_ok = False
+    only_warnings = False
+    service_filter = []
+    icingaweb2 = None
+    show_all = False
+    honor_state = False
+
+    for o, a in opts:
+        if o in ('-C', '--config'):
+            config = a
+        elif o in ('-c', '--critical'):
+            critical_threshold = a
+        elif o in ('-w', '--warning'):
+            warning_threshold = a
+        elif o in ('-g', '--hostgroup'):
+            hostgroup = a
+        elif o in ('-W', '--warning-is-non-ok'):
+            warning_is_non_ok = True
+        elif o in ('--only-warnings'):
+            only_warnings = True
+        elif o in ('-S', '--service'):
+            service_filter.append(a)
+        elif o in ('-v', '--show-all'):
+            show_all = True
+        elif o in ('--icingaweb2'):
+            icingaweb2 = a
+        elif o in ('--honor-state'):
+            warning_is_non_ok = True
+            honor_state = True
+        else:
+            print 'Unhandled option: %s' % o
+            sys.exit(3)
+
+    if config == None:
+        print 'You need to specify the path for the ido2db.cfg configuration file using the --config option.'
+        sys.exit(3)
+
+    if hostgroup == None:
+        print 'You need to specify a host group using the --hostgroup option.'
+        sys.exit(3)
+
+    settings = {}
+
+    fp = open(config)
+
+    for line in iter(fp.readline, ''):
+        if len(line) > 0 and line[0] == '#':
+            continue
+
+        tokens = line.split('=', 2)
+
+        if len(tokens) < 2:
+            continue
+
+        (key, value) = tokens
+        settings[key.strip()] = value.strip()
+
+    fp.close()
+
+    if not 'db_servertype' in settings or settings['db_servertype'] != 'mysql':
+        print 'Error: Unsupported value for the db_servertype setting in', config, '- expected mysql'
+        sys.exit(3)
+
+    for setting in ['db_host', 'db_name', 'db_prefix', 'db_user', 'db_pass']:
+        try:
+            settings[setting]
+        except KeyError:
+            print 'Error:', setting, 'is not set in', config
+            sys.exit(3)
+
+    conn = MySQLdb.connect(host=settings['db_host'], user=settings['db_user'], passwd=settings['db_pass'], db=settings['db_name'])
+
+    # lookup hostgroup and members
+    cursor = conn.cursor()
+    cursor.execute('''
+        SELECT ho.name1 AS host_name, hgm.host_object_id, hs.last_hard_state
+        FROM icinga_hostgroups hg
+        INNER JOIN icinga_objects o ON hg.hostgroup_object_id = o.object_id
+        INNER JOIN icinga_hostgroup_members hgm ON hgm.hostgroup_id = hg.hostgroup_id
+        INNER JOIN icinga_objects ho ON ho.object_id = hgm.host_object_id
+        LEFT JOIN icinga_hoststatus hs ON hs.host_object_id = ho.object_id
+        WHERE o.objecttype_id = 3 AND o.name1 = %s
+        ORDER BY o.name1 ASC
+    ''', [hostgroup])
+
+    hosts_total = 0
+    hosts_problem = 0
+    services_total = 0
+    services_problem = 0
+    services_warning = 0
+    services_critical = 0
+    services_unhandled = 0
+    hosts = {}
+
+    service_sql_filter = get_service_sql_filter(service_filter)
+
+    for hgm_row in cursor.fetchall():
+        hosts_total += 1
+
+        host = {
+            'name': hgm_row[0],
+            'object_id': hgm_row[1],
+            'state': int(hgm_row[2]),
+            'services': {}
+        }
+        hosts[host['name']] = host
+
+        if host['state'] == 0:
+            host['state'] = 0
+        else:
+            host['state'] = 2
+
+        # load servicestatus for host
+        where_extra = ''
+        if service_sql_filter:
+            where_extra = ' AND ' + service_sql_filter.replace('%', '%%')
+
+        cursor = conn.cursor()
+        cursor.execute('''
+            SELECT
+              name2,
+              last_hard_state,
+              problem_has_been_acknowledged,
+              scheduled_downtime_depth
+            FROM icinga_servicestatus st
+            LEFT JOIN icinga_services sv ON sv.service_object_id = st.service_object_id
+            LEFT JOIN icinga_objects so ON so.object_id = st.service_object_id
+            WHERE host_object_id = %%s%s
+            ORDER BY name2 ASC
+        ''' % where_extra, [host['object_id']])
+        rows = cursor.fetchall()
+
+        if len(rows) > 0:
+            for row in rows:
+                services_total += 1
+                service = {
+                    'name': row[0],
+                    'state': int(row[1]),
+                    'has_been_acknowledged': int(row[2]),
+                    'downtime_depth': int(row[3]),
+                    'handled': False
+                }
+                host['services'][row[0]] = service
+                sstate = service['state']
+
+                if service['has_been_acknowledged'] > 0 or service['downtime_depth'] > 0:
+                    service['handled'] = True
+
+                if sstate == 2:
+                    services_critical += 1
+                    if not only_warnings:
+                        services_problem += 1
+                        if not service['handled']:
+                            services_unhandled += 1
+                    else:
+                        sstate = 0
+                elif sstate == 1:
+                    services_warning += 1
+                    if warning_is_non_ok or only_warnings:
+                        services_problem += 1
+                        if not service['handled']:
+                            services_unhandled += 1
+                    else:
+                        sstate = 0
+                else:
+                    sstate = 0
+
+                if sstate > host['state']:
+                    host['state'] = service['state']
+        else:
+            host['state'] = 3
+
+        if host['state'] > 0:
+            hosts_problem += 1
+
+    state = 3
+    if services_unhandled == 0 and hosts_problem == 0:
+        state = 0
+    elif honor_state:
+        if not check_threshold(critical_threshold, services_critical, services_total):
+            state = 2
+        elif not check_threshold(warning_threshold, services_warning, services_total):
+            state = 1
+        else:
+            state = 0
+    else:
+        if not check_threshold(critical_threshold, hosts_problem, hosts_total):
+            state = 2
+        elif not check_threshold(warning_threshold, hosts_problem, hosts_total):
+            state = 1
+        else:
+            state = 0
+
+    state_text = get_state_text(state)
+    service_filter_text = ''
+    if len(service_filter) > 0:
+        service_filter_text = '(%s)' % ','.join(service_filter)
+
+    if hosts_problem > 0:
+        print '%s - %s%s: %d out of %d hosts are in a non-OK state (%d of %d services)' % (
+            state_text, hostgroup, service_filter_text, hosts_problem, hosts_total, services_problem, services_total
+        )
+    else:
+        print '%s - %s%s: All %d services on %d hosts are in an OK state' % (state_text, hostgroup, service_filter_text, services_total, hosts_total)
+
+    # Link to icingaweb2
+    if icingaweb2:
+        url = '%s/monitoring/list/services?sort=service_severity&hostgroup=%s' % (icingaweb2, urllib2.quote(hostgroup))
+        print '<a href="%s" target="_next">Alle Services anzeigen</a>' % url
+        print '<div class="preformatted">'
+
+    # print details
+    for name, host in hosts.iteritems():
+        if show_all is False and host['state'] == 0:
+            continue
+
+        service_list = []
+        for sname, service in host['services'].iteritems():
+            if show_all or service['state'] > 0:
+                if service['handled']:
+                    sname += ' (handled)'
+                service_list.append(sname)
+
+        service_info = ''
+        if len(service_list) > 0:
+            service_info = ': %s' % ', '.join(service_list)
+
+        # wait for fix of https://github.com/Icinga/icingaweb2/issues/3382
+        #print '[%s] %s%s<br/>' % (get_state_text(host['state']), name, service_info)
+        print '%s %s%s<br/>' % (get_state_text(host['state']), name, service_info)
+
+    if icingaweb2:
+        print '</div>'
+
+    # print perfdata
+    perfdata = '|'
+    perfdata += ' hosts_total=%d' % hosts_total
+    if honor_state:
+        perfdata += ' hosts_problem=%d' % hosts_problem
+    else:
+        perfdata += ' hosts_problem=%d;%d;%d;0' % (
+            hosts_problem,
+            get_threshold(warning_threshold, hosts_problem, hosts_total),
+            get_threshold(critical_threshold, hosts_problem, hosts_total)
+        )
+
+    perfdata += ' services_total=%d' % services_total
+    perfdata += ' services_problem=%d' % services_problem
+    perfdata += ' services_unhandled=%d' % services_unhandled
+    if honor_state:
+        perfdata += ' services_warning=%d;%d' % (
+            services_warning,
+            get_threshold(warning_threshold, services_warning, services_total)
+        )
+        perfdata += ' services_critical=%d;;%d' % (
+            services_critical,
+            get_threshold(critical_threshold, services_critical, services_total)
+        )
+    else:
+        perfdata += ' services_warning=%d' % services_warning
+        perfdata += ' services_critical=%d' % services_critical
+    print perfdata
+
+    sys.exit(state)
+
+def usage():
+    print 'Usage: %s --config <config-file> [--critical <threshold(%%)>] [--warning <threshold(%%)>] [--hostgroup <name>] [-S <service-filter>] [-W|--warning-is-non-ok] [--honor-state]' % sys.argv[0]
+    print ''
+    print 'Fetches monitoring data from Icinga\'s IDO database specified in the'
+    print 'IDO2DB configuration file and calculates availability statistics'
+    print 'for host groups.'
+    print
+    print 'Options:'
+    print ' --hostgroup  Name of the hostgroup'
+    print ' --service    Filter for service name, can be set multiple times'
+    print ' --warning    Threshold for status warning (count or percentage)'
+    print ' --critical   Threshold for status critical (count or percentage)'
+    print
+    print ' --warning-is-non-ok  Treats warning as a non-ok state'
+    print ' --honor-state        Respect the state of the individual services'
+    print '                      Thresholds then apply based on state and not on non-ok count'
+    print ' --show-all, -v       Show all services'
+    print ' --icingaweb2         Base URL for Icinga Web 2'
+    print
+
+if __name__ == '__main__':
+    main()
