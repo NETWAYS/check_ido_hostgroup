@@ -182,7 +182,7 @@ def main():
         INNER JOIN icinga_hostgroup_members hgm ON hgm.hostgroup_id = hg.hostgroup_id
         INNER JOIN icinga_objects ho ON ho.object_id = hgm.host_object_id
         LEFT JOIN icinga_hoststatus hs ON hs.host_object_id = ho.object_id
-        WHERE o.objecttype_id = 3 AND o.name1 = %s
+        WHERE o.objecttype_id = 3 AND o.name1 = %s AND ho.is_active = 1
         ORDER BY o.name1 ASC
     ''', [hostgroup])
 
